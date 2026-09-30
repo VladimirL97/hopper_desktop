@@ -47,6 +47,24 @@ pub enum SshProbeError {
     HostKeyNotReceived,
 }
 
+/// Ошибки безопасного чтения Hopper CLI.
+///
+/// Здесь мы разделяем:
+/// - ошибки SSH authentication;
+/// - ошибки выполнения команды;
+/// - ненулевой exit status самого hopperctl.
+#[derive(Debug, Error)]
+pub enum HopperCtlError {
+    #[error(transparent)]
+    Auth(#[from] SshAuthError),
+
+    #[error(transparent)]
+    Command(#[from] SshCommandError),
+
+    #[error("hopperctl --help exited with status {status:?}: {stderr}")]
+    Failed { status: Option<u32>, stderr: String },
+}
+
 #[derive(Debug, Error)]
 pub enum HopperInspectionError {
     #[error(transparent)]
@@ -206,13 +224,15 @@ pub enum SshAuthError {
     Authentication(String),
 }
 
-/// Результат выполнения одной фиксированной SSH-команды.
+/// Результат выполнения фиксированной SSH-команды.
 ///
-/// Этот тип позже пригодится не только inspection,
-/// но и provisioning Hopper.
+/// stdout и stderr храним отдельно.
+/// Это важно, потому что CLI-программы могут печатать
+/// help/errors не только в stdout, но и в stderr.
 #[derive(Debug, Clone)]
 pub struct CommandOutput {
     pub stdout: String,
+    pub stderr: String,
     pub exit_status: Option<u32>,
 }
 
@@ -225,6 +245,17 @@ pub struct CommandOutput {
 #[derive(Debug, Clone)]
 pub struct HopperLayoutDiagnostic {
     pub output: String,
+}
+
+/// Результат безопасного запроса `hopperctl --help`.
+///
+/// Мы пока не пытаемся интерпретировать команды автоматически.
+/// Сначала получаем реальный help от установленной версии Hopper.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HopperCtlHelp {
+    pub stdout: String,
+    pub stderr: String,
+    pub exit_status: Option<u32>,
 }
 
 /// Ошибки выполнения SSH-команды.
@@ -313,74 +344,18 @@ pub async fn test_password_authentication(
     expected_fingerprint: &str,
     timeout_duration: Duration,
 ) -> Result<(), SshAuthError> {
-    let observed_key = Arc::new(Mutex::new(None));
-
-    let handler = TrustedHostHandler {
-        expected_fingerprint: expected_fingerprint.to_string(),
-        observed_key: Arc::clone(&observed_key),
-    };
-
-    let config = Arc::new(client::Config::default());
-
-    // ---------------------------------------------------------
-    // ЭТАП 1:
-    // SSH connect + обязательная проверка host key.
-    // ---------------------------------------------------------
-
-    let connect_result = timeout(
+    let session = connect_authenticated(
+        host,
+        port,
+        user,
+        password,
+        expected_fingerprint,
         timeout_duration,
-        client::connect(config, (host, port), handler),
     )
-    .await
-    .map_err(|_| SshAuthError::Timeout)?;
+    .await?;
 
-    let mut session = match connect_result {
-        Ok(session) => session,
-
-        Err(error) => {
-            // Если сервер успел прислать host key,
-            // проверяем, не был ли причиной ошибки mismatch.
-            let actual_fingerprint = observed_key
-                .lock()
-                .ok()
-                .and_then(|key| key.clone())
-                .map(|key| key.fingerprint);
-
-            if let Some(actual) = actual_fingerprint
-                && actual != expected_fingerprint
-            {
-                return Err(SshAuthError::HostKeyMismatch {
-                    expected: expected_fingerprint.to_string(),
-                    actual,
-                });
-            }
-
-            return Err(SshAuthError::Connection(error.to_string()));
-        }
-    };
-
-    // ---------------------------------------------------------
-    // ЭТАП 2:
-    // Только после успешной проверки host key
-    // разрешаем password authentication.
-    // ---------------------------------------------------------
-
-    let auth_result = timeout(
-        timeout_duration,
-        session.authenticate_password(user.to_string(), password.to_string()),
-    )
-    .await
-    .map_err(|_| SshAuthError::Timeout)?
-    .map_err(|error| SshAuthError::Authentication(error.to_string()))?;
-
-    let authenticated = auth_result.success();
-
-    // Мы только проверяем credentials.
-    //
-    // Shell и SSH channel здесь не открываются.
-    //
-    // Независимо от результата authentication
-    // аккуратно закрываем SSH session.
+    // Authentication успешна.
+    // Никакие SSH channels и команды не открываем.
     let _ = session
         .disconnect(
             russh::Disconnect::ByApplication,
@@ -389,11 +364,7 @@ pub async fn test_password_authentication(
         )
         .await;
 
-    if authenticated {
-        Ok(())
-    } else {
-        Err(SshAuthError::AuthenticationRejected)
-    }
+    Ok(())
 }
 
 /// Выполняет команду внутри уже authenticated SSH session.
@@ -424,13 +395,20 @@ async fn execute_command(
             .map_err(|error| SshCommandError::Execute(error.to_string()))?;
 
         let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
         let mut exit_status = None;
 
         // Читаем события до закрытия канала.
         while let Some(message) = channel.wait().await {
             match message {
+                // Обычный stdout команды.
                 ChannelMsg::Data { data } => {
                     stdout.extend_from_slice(&data);
+                }
+
+                // SSH extended-data с кодом 1 является stderr.
+                ChannelMsg::ExtendedData { data, ext: 1 } => {
+                    stderr.extend_from_slice(&data);
                 }
 
                 ChannelMsg::ExitStatus {
@@ -440,14 +418,14 @@ async fn execute_command(
                 }
 
                 _ => {
-                    // Остальные SSH channel events
-                    // для read-only inspection нам пока не нужны.
+                    // Остальные SSH channel events пока не нужны.
                 }
             }
         }
 
         Ok(CommandOutput {
             stdout: String::from_utf8_lossy(&stdout).into_owned(),
+            stderr: String::from_utf8_lossy(&stderr).into_owned(),
             exit_status,
         })
     };
@@ -930,6 +908,66 @@ fi
     parse_inspection_output(&output.stdout)
 }
 
+/// Получает help установленного Hopper CLI.
+///
+/// Эта функция ничего не изменяет на сервере.
+///
+/// Выполняется только:
+///
+/// Выполняется только команда `$HOME/hopper/hopperctl --help`.
+///
+/// Никакие аргументы пользователя в shell-команду
+/// не подставляются.
+pub async fn read_hopperctl_help(
+    host: &str,
+    port: u16,
+    user: &str,
+    password: &str,
+    expected_fingerprint: &str,
+    timeout_duration: Duration,
+) -> Result<HopperCtlHelp, HopperCtlError> {
+    let session = connect_authenticated(
+        host,
+        port,
+        user,
+        password,
+        expected_fingerprint,
+        timeout_duration,
+    )
+    .await?;
+
+    // Команда полностью фиксированная.
+    //
+    // Никакого shell injection здесь быть не может,
+    // потому что пользовательские данные в command string
+    // не вставляются.
+    const COMMAND: &str = r#""$HOME/hopper/hopperctl" --help"#;
+
+    let output = execute_command(&session, COMMAND, timeout_duration).await?;
+
+    let _ = session
+        .disconnect(
+            russh::Disconnect::ByApplication,
+            "Hopper CLI inspection complete",
+            "",
+        )
+        .await;
+
+    // Обычно --help завершает работу с кодом 0.
+    if output.exit_status != Some(0) {
+        return Err(HopperCtlError::Failed {
+            status: output.exit_status,
+            stderr: output.stderr,
+        });
+    }
+
+    Ok(HopperCtlHelp {
+        stdout: output.stdout,
+        stderr: output.stderr,
+        exit_status: output.exit_status,
+    })
+}
+
 fn parse_inspection_output(output: &str) -> Result<HopperServerInspection, HopperInspectionError> {
     let mut os = None;
     let mut architecture = None;
@@ -977,26 +1015,24 @@ fn parse_inspection_output(output: &str) -> Result<HopperServerInspection, Hoppe
         let key = raw_key.trim();
         let value = raw_value.trim();
 
+        #[cfg(test)]
+        eprintln!("inspection field: key={key:?}, value={value:?}");
+
         match key {
             "os" => {
                 os = Some(value.to_string());
             }
 
-            "arch" => {
+            "arch" | "architecture" => {
                 architecture = Some(value.to_string());
             }
 
-            "version_json" => {
-                let value = value.trim();
+            "version_json" if !value.is_empty() => {
+                let parsed: HopperVersionInfo = serde_json::from_str(value).map_err(|error| {
+                    HopperInspectionError::InvalidVersionJson(error.to_string())
+                })?;
 
-                if !value.is_empty() {
-                    let parsed: HopperVersionInfo =
-                        serde_json::from_str(value).map_err(|error| {
-                            HopperInspectionError::InvalidVersionJson(error.to_string())
-                        })?;
-
-                    version = Some(parsed);
-                }
+                version = Some(parsed);
             }
 
             "hopper_directory" => {
@@ -1096,6 +1132,90 @@ fn parse_inspection_output(output: &str) -> Result<HopperServerInspection, Hoppe
         legacy_configure_script,
         legacy_common_script,
     })
+}
+
+/// Создаёт authenticated SSH session с обязательной
+/// проверкой ранее подтверждённого host-key fingerprint.
+///
+/// Порядок принципиально важен:
+///
+/// 1. TCP connection
+/// 2. SSH handshake
+/// 3. host-key verification
+/// 4. только после совпадения fingerprint отправляется password
+///
+/// Таким образом пароль никогда не отправляется серверу,
+/// чей ключ отличается от ожидаемого.
+async fn connect_authenticated(
+    host: &str,
+    port: u16,
+    user: &str,
+    password: &str,
+    expected_fingerprint: &str,
+    timeout_duration: Duration,
+) -> Result<client::Handle<TrustedHostHandler>, SshAuthError> {
+    let observed_key = Arc::new(Mutex::new(None));
+
+    let handler = TrustedHostHandler {
+        expected_fingerprint: expected_fingerprint.to_string(),
+        observed_key: Arc::clone(&observed_key),
+    };
+
+    let config = Arc::new(client::Config::default());
+
+    let connect_result = timeout(
+        timeout_duration,
+        client::connect(config, (host, port), handler),
+    )
+    .await
+    .map_err(|_| SshAuthError::Timeout)?;
+
+    let mut session = match connect_result {
+        Ok(session) => session,
+
+        Err(error) => {
+            let actual_fingerprint = observed_key
+                .lock()
+                .ok()
+                .and_then(|key| key.clone())
+                .map(|key| key.fingerprint);
+
+            if let Some(actual) = actual_fingerprint
+                && actual != expected_fingerprint
+            {
+                return Err(SshAuthError::HostKeyMismatch {
+                    expected: expected_fingerprint.to_string(),
+                    actual,
+                });
+            }
+
+            return Err(SshAuthError::Connection(error.to_string()));
+        }
+    };
+
+    // Password отправляется только после успешной
+    // проверки host-key fingerprint.
+    let auth_result = timeout(
+        timeout_duration,
+        session.authenticate_password(user.to_string(), password.to_string()),
+    )
+    .await
+    .map_err(|_| SshAuthError::Timeout)?
+    .map_err(|error| SshAuthError::Authentication(error.to_string()))?;
+
+    if !auth_result.success() {
+        let _ = session
+            .disconnect(
+                russh::Disconnect::ByApplication,
+                "Authentication rejected",
+                "",
+            )
+            .await;
+
+        return Err(SshAuthError::AuthenticationRejected);
+    }
+
+    Ok(session)
 }
 
 #[cfg(test)]

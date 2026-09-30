@@ -221,6 +221,30 @@ pub async fn probe_host_key(
     }
 }
 
+/// Разрешённые исходные файлы Hopper.
+///
+/// Здесь намеренно нет произвольного пути.
+/// Desktop-клиент не должен превращаться
+/// в универсальный SSH file reader.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HopperSourceFile {
+    Start,
+    Configure,
+    Status,
+}
+
+impl HopperSourceFile {
+    fn command(self) -> &'static str {
+        match self {
+            Self::Start => r#"cat "$HOME/hopper/hopper/commands/start.py""#,
+
+            Self::Configure => r#"cat "$HOME/hopper/hopper/commands/configure.py""#,
+
+            Self::Status => r#"cat "$HOME/hopper/hopper/commands/status.py""#,
+        }
+    }
+}
+
 /// Ошибки проверки SSH authentication.
 ///
 /// Здесь специально разделяем:
@@ -592,6 +616,11 @@ find "$HOME/hopper" \
     })
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HopperSourceContent {
+    pub content: String,
+}
+
 /// Информация из Hopper VERSION.json.
 ///
 /// Это позволяет desktop-клиенту понимать,
@@ -624,6 +653,18 @@ pub enum HopperLayoutKind {
     ModernCli,
     LegacyScripts,
     Unknown,
+}
+
+#[derive(Debug, Error)]
+pub enum HopperSourceError {
+    #[error(transparent)]
+    Auth(#[from] SshAuthError),
+
+    #[error(transparent)]
+    Command(#[from] SshCommandError),
+
+    #[error("could not read Hopper source file, status {status:?}: {stderr}")]
+    Failed { status: Option<u32>, stderr: String },
 }
 
 /// Результат безопасной проверки Hopper server.
@@ -931,6 +972,51 @@ fi
         .await;
 
     parse_inspection_output(&output.stdout)
+}
+
+/// Читает один заранее разрешённый исходный файл Hopper.
+///
+/// Выполняется только `cat` конкретного известного файла.
+/// Никакие файлы на сервере не изменяются.
+pub async fn read_hopper_source(
+    host: &str,
+    port: u16,
+    user: &str,
+    password: &str,
+    expected_fingerprint: &str,
+    source: HopperSourceFile,
+    timeout_duration: Duration,
+) -> Result<HopperSourceContent, HopperSourceError> {
+    let session = connect_authenticated(
+        host,
+        port,
+        user,
+        password,
+        expected_fingerprint,
+        timeout_duration,
+    )
+    .await?;
+
+    let output = execute_command(&session, source.command(), timeout_duration).await?;
+
+    let _ = session
+        .disconnect(
+            russh::Disconnect::ByApplication,
+            "Hopper source inspection complete",
+            "",
+        )
+        .await;
+
+    if output.exit_status != Some(0) {
+        return Err(HopperSourceError::Failed {
+            status: output.exit_status,
+            stderr: output.stderr,
+        });
+    }
+
+    Ok(HopperSourceContent {
+        content: output.stdout,
+    })
 }
 
 /// Получает help установленного Hopper CLI.

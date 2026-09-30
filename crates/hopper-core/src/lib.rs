@@ -196,6 +196,157 @@ impl HopChain {
     }
 }
 
+/// Реальная роль hop-а на стороне Hopper.
+///
+/// Важно:
+/// - первый сервер многосерверной цепочки является Entry для UI,
+///   но на сервере Hopper он работает как `relay`;
+/// - только последний сервер цепочки работает как `exit`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum HopRole {
+    /// Промежуточный узел, передающий трафик дальше.
+    Relay,
+
+    /// Последний узел цепочки, выпускающий трафик в интернет.
+    Exit,
+}
+
+/// Один заранее рассчитанный hop внутри каскада.
+///
+/// Здесь пока нет SSH-паролей, tunnel ports и overlay IP.
+/// Это только структурный план цепочки.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PlannedHop {
+    /// Сервер из нашей Server Library.
+    pub server_id: ServerId,
+
+    /// Позиция сервера в цепочке.
+    ///
+    /// 0 = первый сервер, к которому подключается клиент.
+    pub index: usize,
+
+    /// Серверная роль Hopper.
+    pub role: HopRole,
+
+    /// Предыдущий сервер в направлении к клиенту.
+    ///
+    /// Для index=0 upstream отсутствует.
+    pub upstream: Option<ServerId>,
+
+    /// Следующий сервер в направлении к exit.
+    ///
+    /// Для последнего hop downstream отсутствует.
+    pub downstream: Option<ServerId>,
+}
+
+/// Рассчитанный план Hopper-цепочки.
+///
+/// HopChain хранит пользовательский порядок серверов.
+/// ChainPlan превращает этот порядок в реальные роли
+/// и связи между соседними узлами.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChainPlan {
+    /// Один и тот же chain_id используется на всех hops.
+    pub chain_id: ChainId,
+
+    /// Hops идут в направлении:
+    ///
+    /// Desktop -> Entry -> Relay -> ... -> Exit.
+    pub hops: Vec<PlannedHop>,
+}
+
+impl ChainPlan {
+    /// Строит структурный план из HopChain.
+    ///
+    /// Пример для трёх серверов:
+    ///
+    /// index 0 -> relay
+    /// index 1 -> relay
+    /// index 2 -> exit
+    ///
+    /// Для одного сервера:
+    ///
+    /// index 0 -> exit
+    pub fn from_chain(chain: &HopChain) -> Self {
+        // HopChain::new() не разрешает пустую цепочку.
+        let last_index = chain.servers.len() - 1;
+
+        let hops = chain
+            .servers
+            .iter()
+            .enumerate()
+            .map(|(index, server_id)| {
+                // Только последний сервер является exit.
+                // Все предыдущие серверы работают как relay.
+                let role = if index == last_index {
+                    HopRole::Exit
+                } else {
+                    HopRole::Relay
+                };
+
+                // Upstream — предыдущий сервер в цепочке.
+                //
+                // Для самого первого hop его нет,
+                // потому что перед ним находится desktop-клиент.
+                let upstream = if index == 0 {
+                    None
+                } else {
+                    Some(chain.servers[index - 1])
+                };
+
+                // Downstream — следующий сервер в сторону exit.
+                //
+                // У exit downstream отсутствует.
+                let downstream = if index == last_index {
+                    None
+                } else {
+                    Some(chain.servers[index + 1])
+                };
+
+                PlannedHop {
+                    server_id: *server_id,
+                    index,
+                    role,
+                    upstream,
+                    downstream,
+                }
+            })
+            .collect();
+
+        Self {
+            chain_id: chain.id,
+            hops,
+        }
+    }
+
+    /// Первый hop.
+    ///
+    /// Именно к нему позже будет подключаться desktop-клиент.
+    pub fn entry(&self) -> &PlannedHop {
+        self.hops
+            .first()
+            .expect("ChainPlan always contains at least one hop")
+    }
+
+    /// Последний hop.
+    ///
+    /// Он всегда имеет Hopper role=exit.
+    pub fn exit(&self) -> &PlannedHop {
+        self.hops
+            .last()
+            .expect("ChainPlan always contains at least one hop")
+    }
+
+    /// Порядок provisioning серверов.
+    ///
+    /// Hopper должен подготавливаться от конца цепочки к началу:
+    ///
+    /// Exit -> Relay -> ... -> Entry.
+    pub fn provisioning_order(&self) -> impl DoubleEndedIterator<Item = &PlannedHop> {
+        self.hops.iter().rev()
+    }
+}
+
 /// Секретная строка.
 ///
 /// Пока это обычный String в памяти, но Debug специально скрывает
@@ -538,5 +689,99 @@ mod tests {
         let result = HopChain::new("Empty chain", vec![]);
 
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn builds_single_hop_chain_plan() {
+        let server = ServerId::new();
+
+        let chain = HopChain::new("Single hop", vec![server]).unwrap();
+
+        let plan = ChainPlan::from_chain(&chain);
+
+        // Один сервер одновременно является entry и exit
+        // с точки зрения пользовательской цепочки.
+        assert_eq!(plan.hops.len(), 1);
+
+        // Но серверная роль Hopper для единственного hop — exit.
+        assert_eq!(plan.hops[0].role, HopRole::Exit);
+
+        assert_eq!(plan.hops[0].index, 0);
+        assert_eq!(plan.hops[0].server_id, server);
+
+        // Соседних серверов нет.
+        assert_eq!(plan.hops[0].upstream, None);
+        assert_eq!(plan.hops[0].downstream, None);
+
+        assert_eq!(plan.entry(), plan.exit());
+    }
+
+    #[test]
+    fn builds_three_hop_chain_plan() {
+        let server_a = ServerId::new();
+        let server_b = ServerId::new();
+        let server_c = ServerId::new();
+
+        let chain = HopChain::new("Three hop cascade", vec![server_a, server_b, server_c]).unwrap();
+
+        let plan = ChainPlan::from_chain(&chain);
+
+        assert_eq!(plan.hops.len(), 3);
+
+        // ---------------------------------------------------------
+        // Первый сервер.
+        //
+        // Для UI это Entry.
+        // Для Hopper server-side это relay.
+        // ---------------------------------------------------------
+
+        assert_eq!(plan.hops[0].server_id, server_a);
+        assert_eq!(plan.hops[0].index, 0);
+        assert_eq!(plan.hops[0].role, HopRole::Relay);
+
+        assert_eq!(plan.hops[0].upstream, None);
+        assert_eq!(plan.hops[0].downstream, Some(server_b));
+
+        // ---------------------------------------------------------
+        // Средний сервер — обычный relay.
+        // ---------------------------------------------------------
+
+        assert_eq!(plan.hops[1].server_id, server_b);
+        assert_eq!(plan.hops[1].index, 1);
+        assert_eq!(plan.hops[1].role, HopRole::Relay);
+
+        assert_eq!(plan.hops[1].upstream, Some(server_a));
+
+        assert_eq!(plan.hops[1].downstream, Some(server_c));
+
+        // ---------------------------------------------------------
+        // Последний сервер — exit.
+        // ---------------------------------------------------------
+
+        assert_eq!(plan.hops[2].server_id, server_c);
+        assert_eq!(plan.hops[2].index, 2);
+        assert_eq!(plan.hops[2].role, HopRole::Exit);
+
+        assert_eq!(plan.hops[2].upstream, Some(server_b));
+
+        assert_eq!(plan.hops[2].downstream, None);
+    }
+
+    #[test]
+    fn chain_plan_provisions_exit_to_entry() {
+        let server_a = ServerId::new();
+        let server_b = ServerId::new();
+        let server_c = ServerId::new();
+
+        let chain = HopChain::new("Three hop cascade", vec![server_a, server_b, server_c]).unwrap();
+
+        let plan = ChainPlan::from_chain(&chain);
+
+        let order: Vec<ServerId> = plan.provisioning_order().map(|hop| hop.server_id).collect();
+
+        // Provisioning идёт в направлении:
+        //
+        // Exit -> Relay -> Entry.
+        assert_eq!(order, vec![server_c, server_b, server_a,]);
     }
 }

@@ -416,6 +416,48 @@ pub async fn test_password_authentication(
     Ok(())
 }
 
+/// Проверяет SSH authentication через Hopper private key.
+///
+/// Проверяется:
+///
+/// 1. TCP/SSH соединение.
+/// 2. Точный pinned host fingerprint.
+/// 3. Hopper private key.
+/// 4. SSH public-key authentication.
+///
+/// Никакие команды на сервере не выполняются.
+/// Никакие файлы на сервере не изменяются.
+pub async fn test_private_key_authentication(
+    host: &str,
+    port: u16,
+    user: &str,
+    private_key: &str,
+    expected_fingerprint: &str,
+    timeout_duration: Duration,
+) -> Result<(), SshAuthError> {
+    let session = connect_authenticated_with_private_key(
+        host,
+        port,
+        user,
+        private_key,
+        expected_fingerprint,
+        timeout_duration,
+    )
+    .await?;
+
+    // Authentication успешно проверен.
+    // Никакие SSH commands не запускаем.
+    let _ = session
+        .disconnect(
+            russh::Disconnect::ByApplication,
+            "Hopper key authentication test complete",
+            "",
+        )
+        .await;
+
+    Ok(())
+}
+
 /// Выполняет команду внутри уже authenticated SSH session.
 ///
 /// ВАЖНО:
@@ -1064,6 +1106,17 @@ pub async fn read_hopper_node_identity(
         return Err(HopperIdentityError::EmptyPublicKey);
     }
 
+    // Hopper хранит public key в обычном OpenSSH формате:
+    //
+    // ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAA... comment
+    //
+    // Поэтому парсим ВСЮ строку как OpenSSH public key.
+    //
+    // parse_public_key_base64() здесь использовать нельзя:
+    // она ожидает только base64-часть ключа без "ssh-ed25519".
+    russh::keys::ssh_key::PublicKey::from_openssh(&public_key)
+        .map_err(|error| HopperIdentityError::InvalidPublicKey(error.to_string()))?;
+
     // Сразу проверяем, что Rust SSH library действительно
     // понимает полученный OpenSSH private key.
     russh::keys::decode_secret_key(&private_key, None)
@@ -1167,6 +1220,9 @@ pub enum HopperIdentityError {
 
     #[error("invalid Hopper private key: {0}")]
     InvalidPrivateKey(String),
+
+    #[error("invalid Hopper public key: {0}")]
+    InvalidPublicKey(String),
 }
 
 /// Получает help установленного Hopper CLI.
@@ -1487,6 +1543,102 @@ async fn connect_authenticated(
     Ok(session)
 }
 
+async fn connect_authenticated_with_private_key(
+    host: &str,
+    port: u16,
+    user: &str,
+    private_key: &str,
+    expected_fingerprint: &str,
+    timeout_duration: Duration,
+) -> Result<client::Handle<TrustedHostHandler>, SshAuthError> {
+    let observed_key = Arc::new(Mutex::new(None));
+
+    let handler = TrustedHostHandler {
+        expected_fingerprint: expected_fingerprint.to_string(),
+        observed_key: Arc::clone(&observed_key),
+    };
+
+    let config = Arc::new(client::Config::default());
+
+    let connect_result = timeout(
+        timeout_duration,
+        client::connect(config, (host, port), handler),
+    )
+    .await
+    .map_err(|_| SshAuthError::Timeout)?;
+
+    let mut session = match connect_result {
+        Ok(session) => session,
+
+        Err(error) => {
+            let actual_fingerprint = observed_key
+                .lock()
+                .ok()
+                .and_then(|key| key.clone())
+                .map(|key| key.fingerprint);
+
+            if let Some(actual) = actual_fingerprint
+                && actual != expected_fingerprint
+            {
+                return Err(SshAuthError::HostKeyMismatch {
+                    expected: expected_fingerprint.to_string(),
+                    actual,
+                });
+            }
+
+            return Err(SshAuthError::Connection(error.to_string()));
+        }
+    };
+
+    // Парсим Hopper private key прямо из памяти.
+    //
+    // Ключ не записывается во временный файл и
+    // не передаётся внешней программе ssh.exe.
+    let decoded_key = russh::keys::decode_secret_key(private_key, None).map_err(|error| {
+        SshAuthError::Authentication(format!("could not decode private key: {error}"))
+    })?;
+
+    // Для ED25519 hash_alg будет None.
+    //
+    // best_supported_rsa_hash() нужен также для того,
+    // чтобы эта функция в будущем корректно работала
+    // и с RSA identity.
+    let hash_alg = session
+        .best_supported_rsa_hash()
+        .await
+        .map_err(|error| SshAuthError::Authentication(error.to_string()))?
+        .flatten();
+
+    // Russh требует специальную обёртку
+    // private key + возможный RSA hash algorithm.
+    let authentication_key =
+        russh::keys::PrivateKeyWithHashAlg::new(Arc::new(decoded_key), hash_alg);
+
+    // Аутентификация происходит только ПОСЛЕ
+    // успешной проверки pinned SSH host fingerprint.
+    let authentication = tokio::time::timeout(
+        timeout_duration,
+        session.authenticate_publickey(user, authentication_key),
+    )
+    .await
+    .map_err(|_| SshAuthError::Timeout)?
+    .map_err(|error| SshAuthError::Authentication(error.to_string()))?;
+
+    if !authentication.success() {
+        let _ = session
+            .disconnect(
+                russh::Disconnect::ByApplication,
+                "Authentication rejected",
+                "",
+            )
+            .await;
+
+        return Err(SshAuthError::AuthenticationRejected);
+    }
+
+    Ok(session)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1634,5 +1786,20 @@ mod tests {
             result,
             Err(HopperInspectionError::InvalidVersionJson(_))
         ));
+    }
+
+    #[test]
+    fn parses_openssh_ed25519_public_key() {
+        // Это тестовый публичный ключ.
+        // Никаких приватных данных здесь нет.
+        let public_key = concat!(
+            "ssh-ed25519 ",
+            "AAAAC3NzaC1lZDI1NTE5AAAAILM+rvN+",
+            "ot98qgEN796jTiQfZfG1KaT0PtFDJ/XFSqti"
+        );
+
+        let parsed = russh::keys::ssh_key::PublicKey::from_openssh(public_key);
+
+        assert!(parsed.is_ok());
     }
 }

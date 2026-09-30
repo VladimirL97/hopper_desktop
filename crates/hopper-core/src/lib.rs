@@ -3,6 +3,14 @@ use std::fmt;
 use thiserror::Error;
 use uuid::Uuid;
 
+mod validation;
+
+pub use validation::{
+    MAX_HOST_CHARS, MAX_PASSWORD_CHARS, MAX_SERVER_NAME_CHARS, MAX_SSH_USER_CHARS, normalize_host,
+    normalize_ip_address, normalize_server_name, normalize_ssh_user, validate_password,
+    validate_ssh_port,
+};
+
 /// Уникальный локальный ID сервера.
 ///
 /// Этот ID не приходит от Hopper server.
@@ -60,7 +68,15 @@ impl ServerProfile {
         let host = host.into();
         let user = user.into();
 
-        validate_basic_server_fields(&name, &host, port, &user)?;
+        // Нормализация и валидация происходят внутри core.
+        //
+        // Даже если позже появится другой UI, CLI или IPC-клиент,
+        // некорректные данные всё равно не попадут в ServerProfile.
+        let name = normalize_server_name(&name)?;
+        let host = normalize_host(&host)?;
+        let user = normalize_ssh_user(&user)?;
+
+        validate_ssh_port(port)?;
 
         Ok(Self {
             id: ServerId::new(),
@@ -142,13 +158,16 @@ impl ManualServerConnection {
         let name = name.into();
         let host = host.into();
         let user = user.into();
+
+        let name = normalize_server_name(&name)?;
+        let host = normalize_ip_address(&host)?;
+        let user = normalize_ssh_user(&user)?;
+
+        validate_ssh_port(port)?;
+
         let password = SecretString::new(password);
 
-        validate_basic_server_fields(&name, &host, port, &user)?;
-
-        if password.is_empty() {
-            return Err(CoreError::InvalidServer("password is empty"));
-        }
+        validate_password(password.expose())?;
 
         Ok(Self {
             name,
@@ -158,37 +177,6 @@ impl ManualServerConnection {
             password,
         })
     }
-}
-
-/// Проверяем общие поля.
-///
-/// Вынесено отдельно, потому что эти же проверки нужны:
-/// - постоянному ServerProfile;
-/// - форме ручного подключения;
-/// - позже импорту Hopper profile v2.
-fn validate_basic_server_fields(
-    name: &str,
-    host: &str,
-    port: u16,
-    user: &str,
-) -> Result<(), CoreError> {
-    if name.trim().is_empty() {
-        return Err(CoreError::InvalidServer("name is empty"));
-    }
-
-    if host.trim().is_empty() {
-        return Err(CoreError::InvalidServer("host is empty"));
-    }
-
-    if user.trim().is_empty() {
-        return Err(CoreError::InvalidServer("user is empty"));
-    }
-
-    if port == 0 {
-        return Err(CoreError::InvalidServer("port must be non-zero"));
-    }
-
-    Ok(())
 }
 
 /// Текущее состояние VPN.
@@ -274,5 +262,124 @@ mod tests {
 
         assert!(!debug_output.contains("super-secret"));
         assert!(debug_output.contains("REDACTED"));
+    }
+
+    #[test]
+    fn accepts_ipv4_host() {
+        let profile = ServerProfile::new("Germany", "192.168.1.10", 22, "root").unwrap();
+
+        assert_eq!(profile.host, "192.168.1.10");
+    }
+
+    #[test]
+    fn accepts_ipv6_host() {
+        let profile = ServerProfile::new("IPv6 Server", "[2001:db8::1]", 22, "root").unwrap();
+
+        // Квадратные скобки убираются при нормализации.
+        assert_eq!(profile.host, "2001:db8::1");
+    }
+
+    #[test]
+    fn accepts_hostname() {
+        let profile = ServerProfile::new("Germany", "VPN.Example.COM", 22, "root").unwrap();
+
+        assert_eq!(profile.host, "vpn.example.com");
+    }
+
+    #[test]
+    fn rejects_url_instead_of_host() {
+        let result = ServerProfile::new("Germany", "https://example.com", 22, "root");
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn rejects_hostname_with_spaces() {
+        let result = ServerProfile::new("Germany", "server example.com", 22, "root");
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn rejects_invalid_hostname() {
+        let result = ServerProfile::new("Germany", "-server.example.com", 22, "root");
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn rejects_zero_port() {
+        let result = ServerProfile::new("Germany", "example.com", 0, "root");
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn rejects_user_with_spaces() {
+        let result = ServerProfile::new("Germany", "example.com", 22, "root user");
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn trims_normal_fields() {
+        let profile = ServerProfile::new("  Germany  ", "  example.com  ", 22, "  root  ").unwrap();
+
+        assert_eq!(profile.name, "Germany");
+        assert_eq!(profile.host, "example.com");
+        assert_eq!(profile.user, "root");
+    }
+
+    #[test]
+    fn password_may_contain_spaces() {
+        let connection = ManualServerConnection::new(
+            "Germany",
+            "192.168.1.10",
+            22,
+            "root",
+            " my complicated password ",
+        )
+        .unwrap();
+
+        assert_eq!(connection.password.expose(), " my complicated password ");
+    }
+
+    #[test]
+    fn manual_connection_accepts_ipv4() {
+        let connection =
+            ManualServerConnection::new("Germany", "192.168.1.10", 22, "root", "password").unwrap();
+
+        assert_eq!(connection.host, "192.168.1.10");
+    }
+
+    #[test]
+    fn manual_connection_accepts_ipv6() {
+        let connection =
+            ManualServerConnection::new("Germany", "2001:db8::1", 22, "root", "password").unwrap();
+
+        assert_eq!(connection.host, "2001:db8::1");
+    }
+
+    #[test]
+    fn manual_connection_rejects_hostname() {
+        let result =
+            ManualServerConnection::new("Germany", "server.example.com", 22, "root", "password");
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn manual_connection_rejects_random_string() {
+        let result = ManualServerConnection::new("Germany", "fdvg32", 22, "root", "password");
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn manual_connection_rejects_invalid_ipv4() {
+        let result =
+            ManualServerConnection::new("Germany", "999.999.999.999", 22, "root", "password");
+
+        assert!(result.is_err());
     }
 }

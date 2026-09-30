@@ -1,4 +1,7 @@
-use hopper_core::{ManualServerConnection, TunnelState};
+use hopper_core::{
+    MAX_HOST_CHARS, MAX_PASSWORD_CHARS, MAX_SERVER_NAME_CHARS, MAX_SSH_USER_CHARS,
+    ManualServerConnection, TunnelState,
+};
 use iced::widget::{Space, button, column, container, row, text, text_input};
 use iced::{Element, Fill, Length, Task, Theme};
 
@@ -115,28 +118,94 @@ fn update(app: &mut HopperApp, message: Message) -> Task<Message> {
         }
 
         Message::ServerNameChanged(value) => {
-            app.add_server.name = value;
-            app.add_server.status = None;
+            // Имя может содержать Unicode и обычные пробелы,
+            // но не управляющие символы.
+            //
+            // Например допустимо:
+            // "Germany Server"
+            // "Сервер Германия"
+            //
+            // Но нельзя вставить перенос строки или NUL.
+            if value.chars().count() <= MAX_SERVER_NAME_CHARS
+                && !value.chars().any(char::is_control)
+            {
+                app.add_server.name = value;
+                app.add_server.status = None;
+            }
         }
 
         Message::ServerHostChanged(value) => {
-            app.add_server.host = value;
-            app.add_server.status = None;
+            // Поле предназначено именно для IP-адреса.
+            //
+            // IPv4 использует:
+            // 0-9 и .
+            //
+            // IPv6 дополнительно использует:
+            // a-f / A-F, :, [ ]
+            //
+            // Поэтому строки вроде:
+            // fdvg32
+            // google.com
+            // test123
+            //
+            // ввести нельзя.
+            let valid_characters = value.chars().all(|c| {
+                c.is_ascii_digit()
+                    || matches!(c, 'a'..='f' | 'A'..='F')
+                    || c == '.'
+                    || c == ':'
+                    || c == '['
+                    || c == ']'
+            });
+
+            if value.chars().count() <= MAX_HOST_CHARS && valid_characters {
+                app.add_server.host = value;
+                app.add_server.status = None;
+            }
         }
 
         Message::ServerPortChanged(value) => {
-            app.add_server.port = value;
-            app.add_server.status = None;
+            // SSH port состоит только из цифр.
+            //
+            // Максимальное значение u16:
+            // 65535
+            //
+            // Поэтому больше 5 символов вводить нет смысла.
+            let valid = value.len() <= 5 && value.chars().all(|c| c.is_ascii_digit());
+
+            if valid {
+                app.add_server.port = value;
+                app.add_server.status = None;
+            }
         }
 
         Message::ServerUserChanged(value) => {
-            app.add_server.user = value;
-            app.add_server.status = None;
+            // SSH username не должен содержать:
+            // - пробелы;
+            // - переводы строк;
+            // - другие управляющие символы.
+            let valid = value.chars().count() <= MAX_SSH_USER_CHARS
+                && !value.chars().any(|c| c.is_whitespace() || c.is_control());
+
+            if valid {
+                app.add_server.user = value;
+                app.add_server.status = None;
+            }
         }
 
         Message::ServerPasswordChanged(value) => {
-            app.add_server.password = value;
-            app.add_server.status = None;
+            // Пароль почти нельзя фильтровать.
+            //
+            // Реальный SSH password вполне может содержать:
+            // ! @ # $ % ^ & *
+            // пробелы
+            // Unicode
+            //
+            // Поэтому ограничиваем только максимальную длину.
+            if value.chars().count() <= MAX_PASSWORD_CHARS {
+                app.add_server.password = value;
+                app.add_server.status = None;
+            }
         }
 
         Message::ValidateServer => {

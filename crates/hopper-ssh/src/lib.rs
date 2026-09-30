@@ -158,3 +158,184 @@ pub async fn probe_host_key(
         Err(error) => Err(SshProbeError::Connection(error.to_string())),
     }
 }
+
+/// Ошибки проверки SSH authentication.
+///
+/// Здесь специально разделяем:
+///
+/// - сетевую ошибку;
+/// - изменение host key;
+/// - неправильный login/password.
+///
+/// Позже UI сможет показывать пользователю
+/// разные понятные сообщения.
+#[derive(Debug, Error)]
+pub enum SshAuthError {
+    #[error("SSH connection timed out")]
+    Timeout,
+
+    #[error("SSH connection failed: {0}")]
+    Connection(String),
+
+    #[error("SSH host key mismatch. Expected {expected}, received {actual}")]
+    HostKeyMismatch { expected: String, actual: String },
+
+    #[error("SSH authentication was rejected")]
+    AuthenticationRejected,
+
+    #[error("SSH authentication failed: {0}")]
+    Authentication(String),
+}
+
+/// Handler для уже ДОВЕРЕННОГО сервера.
+///
+/// В отличие от ProbeHandler он принимает host key
+/// только в том случае, если fingerprint точно совпадает
+/// с fingerprint, который пользователь видел раньше.
+///
+/// Никакого "accept all".
+struct TrustedHostHandler {
+    expected_fingerprint: String,
+
+    /// Запоминаем реально присланный сервером ключ,
+    /// чтобы в случае mismatch показать его пользователю.
+    observed_key: Arc<Mutex<Option<HostKeyInfo>>>,
+}
+
+impl client::Handler for TrustedHostHandler {
+    type Error = russh::Error;
+
+    async fn check_server_key(
+        &mut self,
+        server_public_key: &PublicKeyOrCertificate,
+    ) -> Result<bool, Self::Error> {
+        let public_key = server_public_key.public_key();
+
+        let fingerprint = public_key.fingerprint(Default::default()).to_string();
+
+        let info = HostKeyInfo {
+            algorithm: public_key.algorithm().as_str().to_string(),
+            fingerprint: fingerprint.clone(),
+        };
+
+        if let Ok(mut observed_key) = self.observed_key.lock() {
+            *observed_key = Some(info);
+        }
+
+        // Доверяем серверу ТОЛЬКО если fingerprint
+        // совпадает с ранее подтверждённым.
+        Ok(fingerprint == self.expected_fingerprint)
+    }
+}
+
+/// Проверяет login/password существующего SSH-сервера.
+///
+/// ВАЖНО:
+///
+/// Эта функция НЕ:
+///
+/// - открывает shell;
+/// - выполняет команды;
+/// - запускает start_server.sh;
+/// - читает файлы;
+/// - пишет файлы;
+/// - меняет iptables;
+/// - устанавливает Hopper.
+///
+/// Она делает только:
+///
+/// TCP
+///   -> SSH handshake
+///   -> host key verification
+///   -> password authentication
+///   -> disconnect
+pub async fn test_password_authentication(
+    host: &str,
+    port: u16,
+    user: &str,
+    password: &str,
+    expected_fingerprint: &str,
+    timeout_duration: Duration,
+) -> Result<(), SshAuthError> {
+    let observed_key = Arc::new(Mutex::new(None));
+
+    let handler = TrustedHostHandler {
+        expected_fingerprint: expected_fingerprint.to_string(),
+        observed_key: Arc::clone(&observed_key),
+    };
+
+    let config = Arc::new(client::Config::default());
+
+    // ---------------------------------------------------------
+    // ЭТАП 1:
+    // SSH connect + обязательная проверка host key.
+    // ---------------------------------------------------------
+
+    let connect_result = timeout(
+        timeout_duration,
+        client::connect(config, (host, port), handler),
+    )
+    .await
+    .map_err(|_| SshAuthError::Timeout)?;
+
+    let mut session = match connect_result {
+        Ok(session) => session,
+
+        Err(error) => {
+            // Если сервер успел прислать host key,
+            // проверяем, не был ли причиной ошибки mismatch.
+            let actual_fingerprint = observed_key
+                .lock()
+                .ok()
+                .and_then(|key| key.clone())
+                .map(|key| key.fingerprint);
+
+            if let Some(actual) = actual_fingerprint
+                && actual != expected_fingerprint
+            {
+                return Err(SshAuthError::HostKeyMismatch {
+                    expected: expected_fingerprint.to_string(),
+                    actual,
+                });
+            }
+
+            return Err(SshAuthError::Connection(error.to_string()));
+        }
+    };
+
+    // ---------------------------------------------------------
+    // ЭТАП 2:
+    // Только после успешной проверки host key
+    // разрешаем password authentication.
+    // ---------------------------------------------------------
+
+    let auth_result = timeout(
+        timeout_duration,
+        session.authenticate_password(user.to_string(), password.to_string()),
+    )
+    .await
+    .map_err(|_| SshAuthError::Timeout)?
+    .map_err(|error| SshAuthError::Authentication(error.to_string()))?;
+
+    let authenticated = auth_result.success();
+
+    // Мы только проверяем credentials.
+    //
+    // Shell и SSH channel здесь не открываются.
+    //
+    // Независимо от результата authentication
+    // аккуратно закрываем SSH session.
+    let _ = session
+        .disconnect(
+            russh::Disconnect::ByApplication,
+            "Hopper authentication test complete",
+            "",
+        )
+        .await;
+
+    if authenticated {
+        Ok(())
+    } else {
+        Err(SshAuthError::AuthenticationRejected)
+    }
+}

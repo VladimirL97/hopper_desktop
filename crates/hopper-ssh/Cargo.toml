@@ -9,3 +9,8 @@ russh.workspace = true
 serde.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
+
+[dev-dependencies]
+# Используется только тестовой CLI-утилитой.
+# Позволяет вводить пароль в консоли без отображения символов.
+rpassword = "7.5"

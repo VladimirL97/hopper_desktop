@@ -958,10 +958,24 @@ fn parse_inspection_output(output: &str) -> Result<HopperServerInspection, Hoppe
     let mut legacy_configure_script = false;
     let mut legacy_common_script = false;
 
-    for line in output.lines() {
-        let Some((key, value)) = line.split_once('=') else {
+    for raw_line in output.lines() {
+        // Защищаемся от:
+        //
+        // - CRLF (\r\n)
+        // - случайных пробелов
+        // - отступов в тестовых строках
+        let line = raw_line.trim();
+
+        if line.is_empty() {
+            continue;
+        }
+
+        let Some((raw_key, raw_value)) = line.split_once('=') else {
             continue;
         };
+
+        let key = raw_key.trim();
+        let value = raw_value.trim();
 
         match key {
             "os" => {

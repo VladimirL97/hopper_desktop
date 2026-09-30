@@ -47,6 +47,17 @@ pub enum SshProbeError {
     HostKeyNotReceived,
 }
 
+/// Разрешённые read-only help-запросы к Hopper CLI.
+///
+/// Произвольную строку пользователя здесь использовать нельзя.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HopperCtlHelpCommand {
+    Root,
+    Start,
+    Status,
+    Configure,
+}
+
 /// Ошибки безопасного чтения Hopper CLI.
 ///
 /// Здесь мы разделяем:
@@ -61,7 +72,7 @@ pub enum HopperCtlError {
     #[error(transparent)]
     Command(#[from] SshCommandError),
 
-    #[error("hopperctl --help exited with status {status:?}: {stderr}")]
+    #[error("hopperctl help command failed with status {status:?}: {stderr}")]
     Failed { status: Option<u32>, stderr: String },
 }
 
@@ -135,6 +146,20 @@ impl client::Handler for ProbeHandler {
         //
         // Первый неизвестный ключ нельзя автоматически считать доверенным.
         Ok(false)
+    }
+}
+
+impl HopperCtlHelpCommand {
+    fn command(self) -> &'static str {
+        match self {
+            Self::Root => r#""$HOME/hopper/hopperctl" --help"#,
+
+            Self::Start => r#""$HOME/hopper/hopperctl" start --help"#,
+
+            Self::Status => r#""$HOME/hopper/hopperctl" status --help"#,
+
+            Self::Configure => r#""$HOME/hopper/hopperctl" configure --help"#,
+        }
     }
 }
 
@@ -924,6 +949,7 @@ pub async fn read_hopperctl_help(
     user: &str,
     password: &str,
     expected_fingerprint: &str,
+    command: HopperCtlHelpCommand,
     timeout_duration: Duration,
 ) -> Result<HopperCtlHelp, HopperCtlError> {
     let session = connect_authenticated(
@@ -941,9 +967,10 @@ pub async fn read_hopperctl_help(
     // Никакого shell injection здесь быть не может,
     // потому что пользовательские данные в command string
     // не вставляются.
-    const COMMAND: &str = r#""$HOME/hopper/hopperctl" --help"#;
 
-    let output = execute_command(&session, COMMAND, timeout_duration).await?;
+    let command_line = command.command();
+
+    let output = execute_command(&session, command_line, timeout_duration).await?;
 
     let _ = session
         .disconnect(
@@ -953,8 +980,14 @@ pub async fn read_hopperctl_help(
         )
         .await;
 
-    // Обычно --help завершает работу с кодом 0.
-    if output.exit_status != Some(0) {
+    // Hopper 3.1.x может выводить help/usage в stderr
+    // и завершаться с кодом 2.
+    //
+    // Поэтому для диагностического help-запроса смотрим
+    // не только на exit status, но и на фактический вывод.
+    let has_usage = output.stdout.contains("Usage:") || output.stderr.contains("Usage:");
+
+    if output.exit_status != Some(0) && !has_usage {
         return Err(HopperCtlError::Failed {
             status: output.exit_status,
             stderr: output.stderr,

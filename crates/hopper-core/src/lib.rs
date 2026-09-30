@@ -16,7 +16,7 @@ pub use validation::{
 /// Этот ID не приходит от Hopper server.
 /// Он нужен именно desktop-приложению для хранения серверов,
 /// построения цепочек и ссылок между объектами.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ServerId(Uuid);
 
 impl ServerId {
@@ -85,6 +85,114 @@ impl ServerProfile {
             port,
             user,
         })
+    }
+}
+
+/// Уникальный идентификатор цепочки.
+///
+/// Hopper использует отдельный UUID для каждой chain.
+/// Этот ID позже будет передаваться серверу при provisioning.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct ChainId(Uuid);
+
+impl ChainId {
+    /// Создаёт новую независимую Hopper chain.
+    pub fn new() -> Self {
+        Self(Uuid::new_v4())
+    }
+
+    pub fn as_uuid(&self) -> Uuid {
+        self.0
+    }
+}
+
+impl Default for ChainId {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Цепочка Hopper-серверов.
+///
+/// Порядок имеет значение:
+///
+/// servers[0]       = entry
+/// servers[last]    = exit
+///
+/// Если сервер один:
+///
+/// servers[0] одновременно entry и exit.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HopChain {
+    pub id: ChainId,
+
+    /// Отображаемое имя.
+    ///
+    /// Например:
+    ///
+    /// Germany -> Netherlands -> USA
+    pub name: String,
+
+    /// ServerId в порядке прохождения трафика:
+    ///
+    /// client -> servers[0] -> servers[1] -> ... -> exit
+    pub servers: Vec<ServerId>,
+}
+
+impl HopChain {
+    /// Создаёт Hopper chain.
+    ///
+    /// Пустая chain недопустима:
+    /// даже single-hop VPN должен иметь один сервер.
+    pub fn new(name: impl Into<String>, servers: Vec<ServerId>) -> Result<Self, CoreError> {
+        let name = name.into();
+        let name = name.trim();
+
+        if name.is_empty() {
+            return Err(CoreError::InvalidServer("chain name is empty"));
+        }
+
+        if servers.is_empty() {
+            return Err(CoreError::InvalidServer(
+                "chain must contain at least one server",
+            ));
+        }
+
+        Ok(Self {
+            id: ChainId::new(),
+            name: name.to_string(),
+            servers,
+        })
+    }
+
+    /// Первый hop.
+    pub fn entry(&self) -> &ServerId {
+        // Constructor гарантирует, что servers не пустой.
+        &self.servers[0]
+    }
+
+    /// Последний hop.
+    pub fn exit(&self) -> &ServerId {
+        self.servers
+            .last()
+            .expect("HopChain always contains at least one server")
+    }
+
+    /// Количество hops.
+    pub fn hop_count(&self) -> usize {
+        self.servers.len()
+    }
+
+    /// Provisioning Hopper выполняется с exit к entry.
+    ///
+    /// Поэтому даём готовый iterator в обратном порядке.
+    pub fn provisioning_order(&self) -> impl DoubleEndedIterator<Item = &ServerId> {
+        self.servers.iter().rev()
+    }
+
+    /// True для обычного single-hop.
+    pub fn is_single_hop(&self) -> bool {
+        self.servers.len() == 1
     }
 }
 
@@ -379,6 +487,55 @@ mod tests {
     fn manual_connection_rejects_invalid_ipv4() {
         let result =
             ManualServerConnection::new("Germany", "999.999.999.999", 22, "root", "password");
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn creates_single_hop_chain() {
+        let server = ServerId::new();
+
+        let chain = HopChain::new("Germany", vec![server]).unwrap();
+
+        assert_eq!(chain.hop_count(), 1);
+        assert!(chain.is_single_hop());
+
+        assert_eq!(*chain.entry(), server);
+        assert_eq!(*chain.exit(), server);
+    }
+
+    #[test]
+    fn keeps_chain_order_from_entry_to_exit() {
+        let entry = ServerId::new();
+        let relay = ServerId::new();
+        let exit = ServerId::new();
+
+        let chain = HopChain::new("Three hop", vec![entry, relay, exit]).unwrap();
+
+        assert_eq!(chain.hop_count(), 3);
+
+        assert_eq!(*chain.entry(), entry);
+        assert_eq!(*chain.exit(), exit);
+
+        assert!(!chain.is_single_hop());
+    }
+
+    #[test]
+    fn provisioning_order_is_exit_to_entry() {
+        let entry = ServerId::new();
+        let relay = ServerId::new();
+        let exit = ServerId::new();
+
+        let chain = HopChain::new("Three hop", vec![entry, relay, exit]).unwrap();
+
+        let order: Vec<ServerId> = chain.provisioning_order().copied().collect();
+
+        assert_eq!(order, vec![exit, relay, entry,]);
+    }
+
+    #[test]
+    fn rejects_empty_chain() {
+        let result = HopChain::new("Empty chain", vec![]);
 
         assert!(result.is_err());
     }

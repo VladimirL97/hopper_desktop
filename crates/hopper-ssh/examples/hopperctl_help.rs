@@ -1,4 +1,4 @@
-use hopper_ssh::read_hopperctl_help;
+use hopper_ssh::{HopperCtlHelpCommand, read_hopperctl_help};
 use std::time::Duration;
 
 #[tokio::main]
@@ -50,6 +50,7 @@ async fn main() {
         user,
         &password,
         fingerprint,
+        HopperCtlHelpCommand::Start,
         Duration::from_secs(10),
     )
     .await

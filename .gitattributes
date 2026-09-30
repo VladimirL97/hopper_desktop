@@ -1,0 +1,17 @@
+# Храним текстовые файлы в репозитории с LF.
+# Git сам преобразует их при необходимости на конкретной ОС.
+* text=auto eol=lf
+
+# Windows-скрипты должны оставаться CRLF.
+*.bat text eol=crlf
+*.cmd text eol=crlf
+*.ps1 text eol=crlf
+
+# Бинарные файлы Git не должен пытаться преобразовывать.
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.ico binary
+*.exe binary
+*.dll binary
+*.zip binary

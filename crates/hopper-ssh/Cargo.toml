@@ -9,6 +9,7 @@ russh.workspace = true
 serde.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
+serde_json.workspace = true
 
 [dev-dependencies]
 # Используется только тестовой CLI-утилитой.

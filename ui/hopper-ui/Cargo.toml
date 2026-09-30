@@ -1,0 +1,9 @@
+[package]
+name = "hopper-ui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+hopper-core = { path = "../../crates/hopper-core" }
+iced.workspace = true

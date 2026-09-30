@@ -347,6 +347,26 @@ impl ChainPlan {
     }
 }
 
+/// Локальная библиотека серверов и цепочек.
+///
+/// Это аналог Server Library + Chains из мобильного Hopper.
+///
+/// Сервер хранится только один раз.
+/// Цепочки содержат только ServerId в нужном порядке.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct HopperLibrary {
+    /// Все сохранённые Hopper-серверы.
+    pub servers: Vec<ServerProfile>,
+
+    /// Все созданные пользователем цепочки.
+    pub chains: Vec<HopChain>,
+
+    /// Цепочка, выбранная сейчас на Home screen.
+    ///
+    /// Это ещё НЕ означает, что VPN подключён.
+    pub selected_chain_id: Option<ChainId>,
+}
+
 /// Секретная строка.
 ///
 /// Пока это обычный String в памяти, но Debug специально скрывает
@@ -438,6 +458,127 @@ impl ManualServerConnection {
     }
 }
 
+impl HopperLibrary {
+    /// Создаёт пустую библиотеку.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Добавляет сервер в общую Server Library.
+    ///
+    /// Один ServerId не должен встречаться дважды.
+    pub fn add_server(&mut self, server: ServerProfile) -> Result<(), LibraryError> {
+        if self.servers.iter().any(|existing| existing.id == server.id) {
+            return Err(LibraryError::DuplicateServer);
+        }
+
+        self.servers.push(server);
+
+        Ok(())
+    }
+
+    /// Возвращает сервер по ServerId.
+    pub fn server(&self, server_id: ServerId) -> Option<&ServerProfile> {
+        self.servers.iter().find(|server| server.id == server_id)
+    }
+
+    /// Добавляет новую цепочку.
+    ///
+    /// Каждый ServerId внутри неё уже должен существовать
+    /// в Server Library.
+    ///
+    /// При этом один сервер МОЖЕТ использоваться
+    /// в нескольких разных цепочках.
+    pub fn add_chain(&mut self, chain: HopChain) -> Result<(), LibraryError> {
+        if self.chains.iter().any(|existing| existing.id == chain.id) {
+            return Err(LibraryError::DuplicateChain);
+        }
+
+        for server_id in &chain.servers {
+            if self.server(*server_id).is_none() {
+                return Err(LibraryError::UnknownServer);
+            }
+        }
+
+        self.chains.push(chain);
+
+        Ok(())
+    }
+
+    /// Получает цепочку по ChainId.
+    pub fn chain(&self, chain_id: ChainId) -> Option<&HopChain> {
+        self.chains.iter().find(|chain| chain.id == chain_id)
+    }
+
+    /// Выбирает цепочку для следующего VPN-подключения.
+    ///
+    /// Здесь VPN пока не запускается.
+    /// Это только выбор пользователя.
+    pub fn select_chain(&mut self, chain_id: ChainId) -> Result<(), LibraryError> {
+        if self.chain(chain_id).is_none() {
+            return Err(LibraryError::UnknownChain);
+        }
+
+        self.selected_chain_id = Some(chain_id);
+
+        Ok(())
+    }
+
+    /// Возвращает выбранную цепочку.
+    pub fn selected_chain(&self) -> Option<&HopChain> {
+        let chain_id = self.selected_chain_id?;
+
+        self.chain(chain_id)
+    }
+
+    /// Удаляет цепочку.
+    ///
+    /// Серверы при этом НЕ удаляются из Server Library,
+    /// потому что они могут использоваться другими цепочками.
+    pub fn remove_chain(&mut self, chain_id: ChainId) -> Result<(), LibraryError> {
+        let position = self
+            .chains
+            .iter()
+            .position(|chain| chain.id == chain_id)
+            .ok_or(LibraryError::UnknownChain)?;
+
+        self.chains.remove(position);
+
+        // Если удалили выбранную цепочку,
+        // Home больше не должен указывать на неё.
+        if self.selected_chain_id == Some(chain_id) {
+            self.selected_chain_id = None;
+        }
+
+        Ok(())
+    }
+
+    /// Удаляет сервер из Server Library.
+    ///
+    /// Нельзя удалить сервер, пока хотя бы одна chain
+    /// всё ещё содержит ссылку на него.
+    pub fn remove_server(&mut self, server_id: ServerId) -> Result<(), LibraryError> {
+        let is_used = self
+            .chains
+            .iter()
+            .any(|chain| chain.servers.contains(&server_id));
+
+        if is_used {
+            return Err(LibraryError::ServerInUse);
+        }
+
+        let position = self
+            .servers
+            .iter()
+            .position(|server| server.id == server_id)
+            .ok_or(LibraryError::UnknownServer)?;
+
+        self.servers.remove(position);
+
+        Ok(())
+    }
+}
+
 /// Текущее состояние VPN.
 ///
 /// Позже состояний станет больше:
@@ -464,6 +605,24 @@ pub enum TunnelState {
 pub enum CoreError {
     #[error("invalid server profile: {0}")]
     InvalidServer(&'static str),
+}
+
+#[derive(Debug, Error, PartialEq, Eq)]
+pub enum LibraryError {
+    #[error("server already exists in the library")]
+    DuplicateServer,
+
+    #[error("chain already exists in the library")]
+    DuplicateChain,
+
+    #[error("chain references unknown server")]
+    UnknownServer,
+
+    #[error("unknown chain")]
+    UnknownChain,
+
+    #[error("server is still used by one or more chains")]
+    ServerInUse,
 }
 
 #[cfg(test)]
@@ -783,5 +942,65 @@ mod tests {
         //
         // Exit -> Relay -> Entry.
         assert_eq!(order, vec![server_c, server_b, server_a,]);
+    }
+
+    #[test]
+    fn same_servers_can_be_used_in_multiple_chains() {
+        let server_a = ServerProfile::new("Server A", "10.0.0.1", 22, "root").unwrap();
+
+        let server_b = ServerProfile::new("Server B", "10.0.0.2", 22, "root").unwrap();
+
+        let a_id = server_a.id;
+        let b_id = server_b.id;
+
+        let mut library = HopperLibrary::new();
+
+        library.add_server(server_a).unwrap();
+        library.add_server(server_b).unwrap();
+
+        // Chain A -> B.
+        let chain_ab = HopChain::new("A -> B", vec![a_id, b_id]).unwrap();
+
+        // Chain B -> A.
+        //
+        // Используются ТЕ ЖЕ ServerId,
+        // но порядок совершенно другой.
+        let chain_ba = HopChain::new("B -> A", vec![b_id, a_id]).unwrap();
+
+        library.add_chain(chain_ab).unwrap();
+        library.add_chain(chain_ba).unwrap();
+
+        assert_eq!(library.servers.len(), 2);
+        assert_eq!(library.chains.len(), 2);
+
+        assert_eq!(library.chains[0].servers, vec![a_id, b_id],);
+
+        assert_eq!(library.chains[1].servers, vec![b_id, a_id],);
+    }
+
+    #[test]
+    fn selects_chain_for_connection() {
+        let server = ServerProfile::new("Server", "10.0.0.1", 22, "root").unwrap();
+
+        let server_id = server.id;
+
+        let mut library = HopperLibrary::new();
+
+        library.add_server(server).unwrap();
+
+        let chain = HopChain::new("My VPN", vec![server_id]).unwrap();
+
+        let chain_id = chain.id;
+
+        library.add_chain(chain).unwrap();
+
+        assert!(library.selected_chain().is_none());
+
+        library.select_chain(chain_id).unwrap();
+
+        let selected = library.selected_chain().unwrap();
+
+        assert_eq!(selected.id, chain_id);
+        assert_eq!(selected.name, "My VPN");
     }
 }

@@ -974,6 +974,107 @@ fi
     parse_inspection_output(&output.stdout)
 }
 
+/// Импортирует уже существующую Hopper identity с подготовленного VPS.
+///
+/// Сервер НЕ изменяется.
+///
+/// Читаются только:
+///
+/// ~/.hopper/id_ed25519
+/// ~/.hopper/id_ed25519.pub
+///
+/// Важно:
+/// приватный ключ остаётся только в памяти.
+/// Здесь он не сохраняется на диск и не выводится в лог.
+pub async fn read_hopper_node_identity(
+    host: &str,
+    port: u16,
+    user: &str,
+    password: &str,
+    expected_fingerprint: &str,
+    timeout_duration: Duration,
+) -> Result<HopperNodeIdentity, HopperIdentityError> {
+    let session = connect_authenticated(
+        host,
+        port,
+        user,
+        password,
+        expected_fingerprint,
+        timeout_duration,
+    )
+    .await?;
+
+    // Команды фиксированные.
+    // Ни один пользовательский параметр не вставляется в shell.
+    let private_output = execute_command(
+        &session,
+        r#"cat "$HOME/.hopper/id_ed25519""#,
+        timeout_duration,
+    )
+    .await?;
+
+    if private_output.exit_status != Some(0) {
+        let _ = session
+            .disconnect(
+                russh::Disconnect::ByApplication,
+                "Hopper identity read failed",
+                "",
+            )
+            .await;
+
+        return Err(HopperIdentityError::PrivateKeyRead {
+            status: private_output.exit_status,
+            stderr: private_output.stderr,
+        });
+    }
+
+    let public_output = execute_command(
+        &session,
+        r#"cat "$HOME/.hopper/id_ed25519.pub""#,
+        timeout_duration,
+    )
+    .await?;
+
+    let _ = session
+        .disconnect(
+            russh::Disconnect::ByApplication,
+            "Hopper identity read complete",
+            "",
+        )
+        .await;
+
+    if public_output.exit_status != Some(0) {
+        return Err(HopperIdentityError::PublicKeyRead {
+            status: public_output.exit_status,
+            stderr: public_output.stderr,
+        });
+    }
+
+    // У приватного OpenSSH key сохраняем внутренние переносы строк.
+    // Удаляем только внешние CR/LF.
+    let private_key = private_output.stdout.trim().to_string();
+
+    let public_key = public_output.stdout.trim().to_string();
+
+    if private_key.is_empty() {
+        return Err(HopperIdentityError::EmptyPrivateKey);
+    }
+
+    if public_key.is_empty() {
+        return Err(HopperIdentityError::EmptyPublicKey);
+    }
+
+    // Сразу проверяем, что Rust SSH library действительно
+    // понимает полученный OpenSSH private key.
+    russh::keys::decode_secret_key(&private_key, None)
+        .map_err(|error| HopperIdentityError::InvalidPrivateKey(error.to_string()))?;
+
+    Ok(HopperNodeIdentity {
+        private_key,
+        public_key,
+    })
+}
+
 /// Читает один заранее разрешённый исходный файл Hopper.
 ///
 /// Выполняется только `cat` конкретного известного файла.
@@ -1017,6 +1118,55 @@ pub async fn read_hopper_source(
     Ok(HopperSourceContent {
         content: output.stdout,
     })
+}
+
+/// SSH identity, созданная Hopper на конкретном сервере.
+///
+/// private_key нельзя выводить в Debug, лог или UI.
+/// Позже он будет храниться в Windows через DPAPI.
+pub struct HopperNodeIdentity {
+    private_key: String,
+    pub public_key: String,
+}
+
+impl HopperNodeIdentity {
+    /// Доступ к приватному ключу только для SSH authentication.
+    pub fn private_key(&self) -> &str {
+        &self.private_key
+    }
+}
+
+impl std::fmt::Debug for HopperNodeIdentity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HopperNodeIdentity")
+            .field("private_key", &"[REDACTED]")
+            .field("public_key", &self.public_key)
+            .finish()
+    }
+}
+
+#[derive(Debug, Error)]
+pub enum HopperIdentityError {
+    #[error(transparent)]
+    Auth(#[from] SshAuthError),
+
+    #[error(transparent)]
+    Command(#[from] SshCommandError),
+
+    #[error("could not read Hopper private key, status {status:?}: {stderr}")]
+    PrivateKeyRead { status: Option<u32>, stderr: String },
+
+    #[error("could not read Hopper public key, status {status:?}: {stderr}")]
+    PublicKeyRead { status: Option<u32>, stderr: String },
+
+    #[error("Hopper private key is empty")]
+    EmptyPrivateKey,
+
+    #[error("Hopper public key is empty")]
+    EmptyPublicKey,
+
+    #[error("invalid Hopper private key: {0}")]
+    InvalidPrivateKey(String),
 }
 
 /// Получает help установленного Hopper CLI.

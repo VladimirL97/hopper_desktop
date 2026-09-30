@@ -5,11 +5,12 @@ use std::time::Duration;
 async fn main() {
     let args: Vec<String> = std::env::args().collect();
 
-    if args.len() != 5 {
+    if args.len() != 6 {
         eprintln!("Usage:");
         eprintln!(
             "cargo run -p hopper-ssh --example hopperctl_help -- \
-             <IP> <PORT> <USER> <FINGERPRINT>"
+             <IP> <PORT> <USER> <FINGERPRINT> \
+             <root|start|configure|status>"
         );
 
         std::process::exit(1);
@@ -28,6 +29,20 @@ async fn main() {
 
     let user = &args[3];
     let fingerprint = &args[4];
+
+    let help_command = match args[5].as_str() {
+        "root" => HopperCtlHelpCommand::Root,
+        "start" => HopperCtlHelpCommand::Start,
+        "configure" => HopperCtlHelpCommand::Configure,
+        "status" => HopperCtlHelpCommand::Status,
+
+        other => {
+            eprintln!("Unknown help command: {other}");
+            eprintln!("Expected: root, start, configure, or status");
+
+            std::process::exit(1);
+        }
+    };
 
     let password = match rpassword::prompt_password("SSH password: ") {
         Ok(password) => password,
@@ -50,7 +65,7 @@ async fn main() {
         user,
         &password,
         fingerprint,
-        HopperCtlHelpCommand::Start,
+        help_command,
         Duration::from_secs(10),
     )
     .await
@@ -67,7 +82,6 @@ async fn main() {
 
             println!();
             println!("Exit status: {:?}", help.exit_status);
-
             println!("No files were modified.");
         }
 

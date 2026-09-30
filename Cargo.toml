@@ -5,6 +5,7 @@ members = [
     "crates/hopper-ipc",
     "service/hopper-service",
     "ui/hopper-ui",
+    "crates/hopper-ssh",
 ]
 
 [workspace.package]
@@ -18,7 +19,31 @@ iced = "0.14"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal"] }
+tokio = { version = "1", features = [
+    "macros",
+    "rt-multi-thread",
+    "signal",
+    "net",
+    "time",
+] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 uuid = { version = "1", features = ["serde", "v4"] }
+
+
+# Отключаем стандартный aws-lc-rs backend.
+#
+# Причина:
+# aws-lc-rs на Windows требует native build toolchain / NASM.
+#
+# ring проще для нашего cross-platform desktop проекта
+# и поддерживается самим russh как штатный crypto backend.
+russh = {
+    version = "0.63.3",
+    default-features = false,
+    features = [
+        "ring",
+        "rsa",
+        "flate2",
+    ],
+}
